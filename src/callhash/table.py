@@ -27,9 +27,9 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
-from ._nhash import hash15, hash22
+from ._nhash import hash12, hash15, hash22
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,13 @@ log = logging.getLogger(__name__)
 # placeholder.
 _BRACKET_CALL_RE = re.compile(r"<([A-Z0-9][A-Z0-9/]{1,15})>")
 _LITERAL_UNRESOLVED = "<...>"
+# A bracketed all-numeric token is a hash the decoder couldn't resolve
+# from its own session table — jt9 ``-Y`` (FST4W / MSK144) and the
+# patched ``decode_ft8`` (FT8 / FT4) both emit the 22-bit hash this way
+# (``<NNNNNNN>``, up to 7 digits since MAX22 = 4194304).  No decoder we
+# drive emits the narrower 12-bit form as a number, so a numeric bracket
+# token is always a 22-bit hash.
+_BRACKET_HASH_RE = re.compile(r"<(\d{1,7})>")
 
 
 class CallHashTable:
@@ -68,6 +75,23 @@ class CallHashTable:
         # bit-mask choices on the hot path.
         self._by_h22: Dict[int, str] = {}
         self._by_h15: Dict[int, str] = {}
+        # 12-bit map kept for API symmetry with the other widths.  No
+        # decoder we drive emits a 12-bit hash as a resolvable number
+        # (decode_ft8's 12-bit site stays ``<...>``), so this is rarely
+        # hit in practice, but populating it is free.
+        self._by_h12: Dict[int, str] = {}
+        # Collision guard.  A hash slot claimed by 2+ DISTINCT calls is
+        # ambiguous — a reverse lookup can't tell which call the hash
+        # meant, so we refuse to resolve it rather than risk emitting the
+        # wrong callsign into a spot (a wrong call pollutes wsprnet /
+        # pskreporter; a missing call is benign).  This matters because
+        # OUR table is persistent and accumulates 10²–10³+ calls, so it
+        # sees far more collisions than WSJT-X's short-lived per-session
+        # table — especially in the 15-bit space (32 768 slots).  These
+        # sets are recomputed on load, not persisted.
+        self._collided_h22: set[int] = set()
+        self._collided_h15: set[int] = set()
+        self._collided_h12: set[int] = set()
         # First-seen timestamp per call — useful for operator forensics
         # ("when did this compound call first appear?") and bounded
         # eviction in future versions.
@@ -105,36 +129,146 @@ class CallHashTable:
         with self._lock:
             return self._add_locked(call)
 
+    def ingest_calls(self, calls: Iterable[str]) -> int:
+        """Add a batch of plaintext callsigns.  Returns the count of NEW
+        entries.
+
+        Convenience for consumers that discover full calls in decoded
+        output (rather than ``<call>`` brackets) — e.g. wspr-recorder's
+        per-cycle spot ingest.  Non-callsign-shaped entries are skipped.
+        """
+        added = 0
+        with self._lock:
+            for call in calls:
+                if not call:
+                    continue
+                call = call.strip()
+                if not _looks_like_callsign(call):
+                    continue
+                if self._add_locked(call):
+                    added += 1
+        return added
+
     def _add_locked(self, call: str) -> bool:
-        h22 = hash22(call)
-        h15 = hash15(call)
-        # Collisions are real but rare; a later call that hashes to the
-        # same h22 / h15 supersedes the earlier one (matches WSJT-X's
-        # session-table "last writer wins" semantics).
-        if (
-            self._by_h22.get(h22) == call
-            and self._by_h15.get(h15) == call
+        is_new = call not in self._first_seen
+        self._index_call(call)
+        if is_new:
+            self._first_seen[call] = datetime.now(tz=timezone.utc).isoformat()
+            self._dirty = True
+        return is_new
+
+    def _index_call(self, call: str) -> None:
+        """Insert ``call`` into the three width-keyed maps, flagging any
+        slot already owned by a *different* call as collided.
+
+        The first call to claim a slot keeps it; a second, distinct call
+        that hashes to the same slot makes it ambiguous (added to the
+        collided set) so neither resolves.  Detection is idempotent and
+        order-independent, so live observation and on-disk replay
+        produce the same ambiguous-slot set.
+        """
+        for hfn, fwd, collided in (
+            (hash22, self._by_h22, self._collided_h22),
+            (hash15, self._by_h15, self._collided_h15),
+            (hash12, self._by_h12, self._collided_h12),
         ):
-            return False
-        self._by_h22[h22] = call
-        self._by_h15[h15] = call
-        self._first_seen.setdefault(
-            call, datetime.now(tz=timezone.utc).isoformat()
-        )
-        self._dirty = True
-        return True
+            h = hfn(call)
+            existing = fwd.get(h)
+            if existing is None:
+                fwd[h] = call
+            elif existing != call:
+                collided.add(h)
 
     # ----- lookup -----
 
     def by_hash22(self, h: int) -> Optional[str]:
-        """Resolve a 22-bit hash (FT8/FT4) to plaintext, or None."""
+        """Resolve a 22-bit hash (FT8/FT4) to plaintext, or None.
+
+        Returns None for an ambiguous (collided) slot — see the collision
+        guard in ``__init__`` — so we never return a guessed call.
+        """
         with self._lock:
-            return self._by_h22.get(h & 0x3FFFFF)
+            h &= 0x3FFFFF
+            if h in self._collided_h22:
+                return None
+            return self._by_h22.get(h)
 
     def by_hash15(self, h: int) -> Optional[str]:
-        """Resolve a 15-bit hash (WSPR Type 3) to plaintext, or None."""
+        """Resolve a 15-bit hash (WSPR Type 3) to plaintext, or None.
+
+        Returns None for an ambiguous (collided) slot.
+        """
         with self._lock:
-            return self._by_h15.get(h & 0x7FFF)
+            h &= 0x7FFF
+            if h in self._collided_h15:
+                return None
+            return self._by_h15.get(h)
+
+    def by_hash12(self, h: int) -> Optional[str]:
+        """Resolve a 12-bit hash to plaintext, or None.
+
+        Returns None for an ambiguous (collided) slot.
+        """
+        with self._lock:
+            h &= 0xFFF
+            if h in self._collided_h12:
+                return None
+            return self._by_h12.get(h)
+
+    # ----- token / message resolution -----
+
+    def resolve_token(self, token: str) -> Optional[str]:
+        """Resolve a single decoded-message token to a plaintext call.
+
+        This is the canonical, shared substitution primitive used by
+        every consumer (psk / meteor-scatter / wspr) so they behave
+        identically.  Cases:
+
+          * ``<NNNNNNN>`` (numeric hash) → :meth:`by_hash22` lookup;
+            returns the plaintext call if we've seen it announced, else
+            ``None`` (still genuinely unknown — keep the placeholder).
+          * ``<...>``       → ``None`` (decoder discarded the hash number;
+            nothing to look up).
+          * ``<CALL>`` / ``<CALL/QRP>`` → the decoder resolved it from its
+            own session table; strip the brackets, **seed our table** with
+            the sighting, and return the bare call.
+          * bare token (``K1ABC``, ``CQ``, ``EM38``) → returned unchanged.
+          * anything else in brackets (garbage) → ``None``.
+        """
+        if not token:
+            return token
+        t = token.strip()
+        if not (t.startswith("<") and t.endswith(">") and len(t) > 2):
+            return t                                   # bare token
+        if t == _LITERAL_UNRESOLVED:
+            return None
+        m = _BRACKET_HASH_RE.fullmatch(t)
+        if m:
+            return self.by_hash22(int(m.group(1)))
+        m = _BRACKET_CALL_RE.fullmatch(t)
+        if m:
+            call = m.group(1)
+            if _looks_like_callsign(call):
+                self.add(call)                          # self-seeding sighting
+                return call
+        return None                                     # bracketed garbage
+
+    def resolve_message(self, message: str) -> str:
+        """Return ``message`` with every resolvable hash token replaced by
+        its plaintext call.
+
+        Unresolvable tokens (``<...>`` or a numeric hash we've never seen
+        announced) are left exactly as-is, so the raw text is preserved
+        when we genuinely can't recover the call.  Token spacing is
+        normalised to single spaces.
+        """
+        if not message:
+            return message
+        out = []
+        for tok in message.split():
+            resolved = self.resolve_token(tok)
+            out.append(resolved if resolved is not None else tok)
+        return " ".join(out)
 
     def __contains__(self, call: str) -> bool:
         with self._lock:
@@ -207,8 +341,7 @@ class CallHashTable:
             if not _looks_like_callsign(call):
                 continue
             instance._first_seen[call] = first_seen
-            instance._by_h22[hash22(call)] = call
-            instance._by_h15[hash15(call)] = call
+            instance._index_call(call)
         instance._observations = int(data.get("observations", 0))
         instance._dirty = False
         log.debug("callhash: loaded %d calls from %s", len(instance), path)
@@ -241,6 +374,68 @@ class CallHashTable:
         tmp.replace(target)
         with self._lock:
             self._dirty = False
+
+    # ----- decoder-seed export -----
+
+    def write_wsprd_hashtable(
+        self,
+        path: Path | str,
+        *,
+        exclude: Optional[Callable[[str], bool]] = None,
+    ) -> int:
+        """Write wsprd's ``hashtable.txt`` (15-bit index → call).
+
+        Pre-populating this file lets ``wsprd`` resolve Type-3 hashes it
+        would otherwise emit as ``<...>`` (wsprd discards the number, so
+        the only way to recover those calls is to seed the decoder ahead
+        of the run).  Format matches wsprd: ``"%5d %s\\n"``.
+
+        ``exclude`` is an optional predicate — calls for which it returns
+        True are omitted.  wsprd-recorder passes its wsprnet
+        negative-cache filter here so consistently-rejected compounds
+        stop being re-emitted; the library itself stays oblivious to that
+        policy.  Returns the number of entries written.
+        """
+        path = Path(path)
+        with self._lock:
+            calls = list(self._first_seen)
+        count = 0
+        with open(path, "w") as f:
+            for call in calls:
+                if exclude is not None and exclude(call):
+                    continue
+                f.write(f"{hash15(call):5d} {call}\n")
+                count += 1
+        return count
+
+    def write_jt9_calls(
+        self,
+        path: Path | str,
+        grids: Optional[Dict[str, str]] = None,
+        *,
+        exclude: Optional[Callable[[str], bool]] = None,
+    ) -> int:
+        """Write jt9's ``fst4w_calls.txt`` (call + grid per line).
+
+        Same role as :meth:`write_wsprd_hashtable` for the jt9 / FST4W
+        side.  The library stores no grids, so the caller may pass a
+        ``{call: grid}`` map; missing grids are rendered as four spaces
+        (jt9's blank-grid convention).  ``exclude`` works as above.
+        Returns the number of entries written.
+        """
+        path = Path(path)
+        grids = grids or {}
+        with self._lock:
+            calls = list(self._first_seen)
+        count = 0
+        with open(path, "w") as f:
+            for call in calls:
+                if exclude is not None and exclude(call):
+                    continue
+                grid = grids.get(call) or "    "
+                f.write(f"{call} {grid}\n")
+                count += 1
+        return count
 
     # ----- introspection -----
 

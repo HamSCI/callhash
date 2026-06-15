@@ -42,6 +42,7 @@ from ._nhash import (
     hash22,
     nhash,
 )
+from .parse import parse_message
 from .table import CallHashTable
 
 __all__ = [
@@ -56,4 +57,5 @@ __all__ = [
     "hash15",
     "hash22",
     "nhash",
+    "parse_message",
 ]

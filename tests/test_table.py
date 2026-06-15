@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from callhash import CallHashTable, hash15, hash22
+from callhash import CallHashTable, hash12, hash15, hash22, parse_message
 
 
 class TestObserve:
@@ -225,6 +225,211 @@ class TestThreadSafety:
         assert not errors, errors
         # All 50 calls should be in the table.
         assert len(t) == 50
+
+
+class TestCollisionGuard:
+    """A hash slot claimed by 2+ distinct calls is ambiguous and must
+    resolve to None — never a guessed (wrong) call."""
+
+    # Deterministic collision pairs (found by brute force over the real
+    # nhash, seed 146):
+    #   * KA0BL / KA0CS  share hash15 == 2570 but DIFFER in hash22.
+    #   * KA05O / KA1XF  share hash22 == 2827543.
+    H15_PAIR = ("KA0BL", "KA0CS")
+    H22_PAIR = ("KA05O", "KA1XF")
+
+    def test_15bit_collision_blocks_resolution(self):
+        a, b = self.H15_PAIR
+        assert hash15(a) == hash15(b)        # precondition
+        t = CallHashTable()
+        t.add(a)
+        t.add(b)
+        # Ambiguous 15-bit slot → neither resolves.
+        assert t.by_hash15(hash15(a)) is None
+        # But both calls are still KNOWN (we just can't reverse the hash).
+        assert a in t and b in t
+
+    def test_15bit_collision_does_not_poison_22bit(self):
+        a, b = self.H15_PAIR
+        assert hash22(a) != hash22(b)        # distinct in 22-bit
+        t = CallHashTable()
+        t.add(a)
+        t.add(b)
+        # 22-bit space is unaffected — each resolves cleanly.
+        assert t.by_hash22(hash22(a)) == a
+        assert t.by_hash22(hash22(b)) == b
+
+    def test_22bit_collision_blocks_resolution(self):
+        a, b = self.H22_PAIR
+        assert hash22(a) == hash22(b)
+        t = CallHashTable()
+        t.add(a)
+        t.add(b)
+        assert t.by_hash22(hash22(a)) is None
+
+    def test_non_colliding_call_still_resolves(self):
+        t = CallHashTable()
+        t.add("K1ABC")
+        assert t.by_hash22(hash22("K1ABC")) == "K1ABC"
+
+    def test_collision_recomputed_on_reload(self, tmp_path):
+        a, b = self.H22_PAIR
+        path = tmp_path / "hashtable.json"
+        t = CallHashTable.load_or_new(path)
+        t.add(a)
+        t.add(b)
+        t.save()
+        # Fresh load must rebuild the ambiguous-slot set from disk.
+        t2 = CallHashTable.load_or_new(path)
+        assert t2.by_hash22(hash22(a)) is None
+        assert a in t2 and b in t2
+
+    def test_resolve_token_skips_collided_hash(self):
+        a, b = self.H22_PAIR
+        t = CallHashTable()
+        t.add(a)
+        t.add(b)
+        # The numeric hash both share resolves to nothing → message keeps
+        # the placeholder rather than fabricating a call.
+        token = f"<{hash22(a):07d}>"
+        assert t.resolve_token(token) is None
+        assert t.resolve_message(f"AC0G {token} 73") == f"AC0G {token} 73"
+
+
+class TestResolveToken:
+
+    def test_numeric_hash_resolves_after_announcement(self):
+        t = CallHashTable()
+        t.observe("<PJ4/K1ABC> CQ")
+        h = hash22("PJ4/K1ABC")
+        assert t.resolve_token(f"<{h:07d}>") == "PJ4/K1ABC"
+
+    def test_numeric_hash_unknown_returns_none(self):
+        t = CallHashTable()
+        # never announced → can't recover
+        assert t.resolve_token("<1234567>") is None
+
+    def test_literal_unresolved_returns_none(self):
+        assert CallHashTable().resolve_token("<...>") is None
+
+    def test_bracketed_call_is_stripped_and_seeded(self):
+        t = CallHashTable()
+        assert t.resolve_token("<VE3/W1XYZ>") == "VE3/W1XYZ"
+        # the sighting seeds the table so the hash now resolves
+        assert "VE3/W1XYZ" in t
+        assert t.by_hash22(hash22("VE3/W1XYZ")) == "VE3/W1XYZ"
+
+    def test_bare_token_passthrough(self):
+        t = CallHashTable()
+        assert t.resolve_token("K1ABC") == "K1ABC"
+        assert t.resolve_token("EM38") == "EM38"
+
+    def test_bracketed_garbage_returns_none(self):
+        assert CallHashTable().resolve_token("<!!!>") is None
+
+
+class TestResolveMessage:
+
+    def test_substitutes_known_hash_leaves_rest(self):
+        t = CallHashTable()
+        t.observe("<PJ4/K1ABC> CQ")
+        h = hash22("PJ4/K1ABC")
+        msg = f"AC0G <{h:07d}> -12"
+        assert t.resolve_message(msg) == f"AC0G PJ4/K1ABC -12"
+
+    def test_unknown_hash_preserved_verbatim(self):
+        t = CallHashTable()
+        msg = "AC0G <1234567> -12"
+        # nothing learned → leave the placeholder so we don't fabricate
+        assert t.resolve_message(msg) == "AC0G <1234567> -12"
+
+    def test_literal_placeholder_preserved(self):
+        t = CallHashTable()
+        assert t.resolve_message("CQ <...>") == "CQ <...>"
+
+    def test_empty(self):
+        assert CallHashTable().resolve_message("") == ""
+
+
+class TestByHash12:
+
+    def test_h12_lookup_roundtrip(self):
+        t = CallHashTable()
+        t.add("K1ABC/QRP")
+        assert t.by_hash12(hash12("K1ABC/QRP")) == "K1ABC/QRP"
+        assert t.by_hash12(0xABC & 0xFFF) in (None, "K1ABC/QRP")
+
+
+class TestIngestCalls:
+
+    def test_ingest_adds_new_and_counts(self):
+        t = CallHashTable()
+        added = t.ingest_calls(["K1ABC", "VE3/W1XYZ", "K1ABC", "garbage!!"])
+        assert added == 2
+        assert "K1ABC" in t and "VE3/W1XYZ" in t
+        assert t.by_hash22(hash22("VE3/W1XYZ")) == "VE3/W1XYZ"
+
+
+class TestDecoderExport:
+
+    def test_write_wsprd_hashtable_format_and_exclude(self, tmp_path):
+        t = CallHashTable()
+        t.ingest_calls(["K1ABC", "W4UK/P"])
+        path = tmp_path / "hashtable.txt"
+        n = t.write_wsprd_hashtable(path, exclude=lambda c: c == "W4UK/P")
+        assert n == 1
+        lines = path.read_text().splitlines()
+        assert len(lines) == 1
+        idx, call = lines[0].split()
+        assert call == "K1ABC"
+        assert int(idx) == hash15("K1ABC")
+
+    def test_write_jt9_calls_with_grids_and_blank(self, tmp_path):
+        t = CallHashTable()
+        t.ingest_calls(["K1ABC", "AC0G"])
+        path = tmp_path / "fst4w_calls.txt"
+        n = t.write_jt9_calls(path, grids={"K1ABC": "FN42"})
+        assert n == 2
+        body = path.read_text()
+        assert "K1ABC FN42\n" in body
+        assert "AC0G     \n" in body          # blank grid → 4 spaces
+
+
+class TestParseMessage:
+
+    def test_cq_with_grid(self):
+        out = parse_message("CQ K1ABC FN42")
+        assert out["tx_call"] == "K1ABC"
+        assert out["grid"] == "FN42"
+
+    def test_exchange_with_report(self):
+        out = parse_message("AC0G K1ABC R-12")
+        assert out["rx_call"] == "AC0G"
+        assert out["tx_call"] == "K1ABC"
+        assert out["report"] == -12
+
+    def test_resolves_hash_via_table(self):
+        t = CallHashTable()
+        t.observe("<PJ4/K1ABC> CQ")
+        h = hash22("PJ4/K1ABC")
+        out = parse_message(f"AC0G <{h:07d}> 73", table=t)
+        assert out["rx_call"] == "AC0G"
+        assert out["tx_call"] == "PJ4/K1ABC"
+        assert out["message"] == "AC0G PJ4/K1ABC 73"
+
+    def test_unresolved_hash_drops_call_keeps_message(self):
+        t = CallHashTable()
+        out = parse_message("AC0G <1234567> 73", table=t)
+        assert out["rx_call"] == "AC0G"
+        assert out["tx_call"] == ""          # unrecoverable → empty, not "<1234567>"
+        assert out["message"] == "AC0G <1234567> 73"   # raw preserved
+
+    def test_no_table_strips_resolved_brackets_path(self):
+        # Without a table, a bracketed call stays bracketed → dropped
+        # from call fields but message preserved.
+        out = parse_message("CQ <...>")
+        assert out["tx_call"] == ""
+        assert out["message"] == "CQ <...>"
 
 
 class TestStats:

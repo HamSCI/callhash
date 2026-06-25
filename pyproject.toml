@@ -18,8 +18,8 @@ keywords = ["wsjt-x", "ham radio", "ft8", "ft4", "wspr", "callsign", "hash"]
 dependencies = []
 
 [project.urls]
-Homepage      = "https://github.com/mijahauan/callhash"
-"Bug Tracker" = "https://github.com/mijahauan/callhash/issues"
+Homepage      = "https://github.com/HamSCI/callhash"
+"Bug Tracker" = "https://github.com/HamSCI/callhash/issues"
 
 [project.optional-dependencies]
 dev = [

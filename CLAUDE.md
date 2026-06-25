@@ -43,7 +43,7 @@ dependencies** — see `pyproject.toml`'s empty `dependencies = []`.
 ## Authors
 
 - Michael Hauan (AC0G, GitHub: mijahauan)
-- Repo: https://github.com/mijahauan/callhash
+- Repo: https://github.com/HamSCI/callhash
 - `nhash` is a port of WSJT-X's canonical `lib/wsprcode/nhash.c`
   (Bob Jenkins's lookup3, public domain).
 

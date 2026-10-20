@@ -39,6 +39,14 @@ _GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}(?:[A-Xa-x]{2})?$")
 _REPORT_RE = re.compile(r"^R?([+-]?\d+)$")
 
 
+def _is_grid(token: str) -> bool:
+    """A Maidenhead locator, but never the sign-off ``RR73``.  RR73 has a
+    locator's shape (a square in the Arctic Ocean), and WSJT-X never
+    sends that square: a grid read from it would place every station
+    that signs off near the pole."""
+    return bool(_GRID_RE.match(token)) and token.upper() != "RR73"
+
+
 def _plain(token: str) -> Optional[str]:
     """Return a bare callsign token, or ``None`` if it's still bracketed.
 
@@ -63,6 +71,7 @@ def parse_message(message: str, table: Optional[Any] = None) -> Dict[str, Any]:
     Recognized shapes (all approximate; freeform messages return empties):
       "CQ <tx_call> [<grid>]"           — directed CQ
       "<rx_call> <tx_call> <grid>"      — first contact w/ grid
+      "<rx_call> <tx_call> R <grid>"    — reply that acknowledges, w/ grid
       "<rx_call> <tx_call> [R]<report>" — signal report
       "<rx_call> <tx_call> [73|RR73]"   — close
 
@@ -94,12 +103,12 @@ def parse_message(message: str, table: Optional[Any] = None) -> Dict[str, Any]:
             if candidate is not None and _CALL_RE.match(candidate):
                 out["tx_call"] = candidate
                 for later in tokens[i + 1:]:
-                    if _GRID_RE.match(later):
+                    if _is_grid(later):
                         out["grid"] = later
                         break
                 break
     else:
-        # <rx_call> <tx_call> [grid|report|RR73|73]
+        # <rx_call> <tx_call> [grid|R grid|report|RR73|73]
         rx_candidate = _plain(tokens[0])
         if rx_candidate is not None and _CALL_RE.match(rx_candidate):
             out["rx_call"] = rx_candidate
@@ -109,7 +118,9 @@ def parse_message(message: str, table: Optional[Any] = None) -> Dict[str, Any]:
                 out["tx_call"] = tx_candidate
         if len(tokens) >= 3:
             tail = tokens[2]
-            if _GRID_RE.match(tail):
+            if tail == "R" and len(tokens) >= 4 and _is_grid(tokens[3]):
+                out["grid"] = tokens[3]
+            elif _is_grid(tail):
                 out["grid"] = tail
             else:
                 m = _REPORT_RE.match(tail)

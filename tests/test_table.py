@@ -408,6 +408,23 @@ class TestParseMessage:
         assert out["tx_call"] == "K1ABC"
         assert out["report"] == -12
 
+    def test_rr73_is_a_sign_off_not_a_grid(self):
+        out = parse_message("AC0G K1ABC RR73")
+        assert out["tx_call"] == "K1ABC"
+        assert out["grid"] == ""
+        assert out["report"] is None
+
+    def test_reply_with_r_and_grid_carries_the_grid(self):
+        # B4 10-19, a false MSK144 decode: the grid follows a lone "R".
+        out = parse_message("MJ3XMF 1B0OCH R CI31")
+        assert out["tx_call"] == "1B0OCH"
+        assert out["grid"] == "CI31"
+        assert parse_message("AC0G K1ABC R EN37")["grid"] == "EN37"
+
+    def test_first_contact_grid_still_parses(self):
+        assert parse_message("AC0G K1ABC EN37")["grid"] == "EN37"
+        assert parse_message("AC0G K1ABC EN37ab")["grid"] == "EN37ab"
+
     def test_resolves_hash_via_table(self):
         t = CallHashTable()
         t.observe("<PJ4/K1ABC> CQ")
